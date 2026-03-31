@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-tui"
+version = "0.1.0"
+description = "Terminal UI IDE wrapper for Claude Code CLI"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=1.0.0",
+    "rich>=14.0",
+    "pyte>=0.8",
+    "ptyprocess>=0.7",
+]
+
+[project.scripts]
+claude-tui = "claude_tui.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_tui"]
