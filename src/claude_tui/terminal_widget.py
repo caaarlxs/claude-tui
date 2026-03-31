@@ -1,8 +1,9 @@
 """Terminal emulator widget using pyte + ptyprocess.
 
 Runs a command in a real PTY and renders its output via pyte's VT100 emulator.
-All keystrokes and mouse events are forwarded to the PTY, so interactive programs
-(like Claude Code) work exactly as they do in a normal terminal.
+Keystrokes are forwarded to the PTY so interactive programs (like Claude Code)
+work as they do in a normal terminal. Mouse is left to the host terminal for
+native text selection and copy/paste.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import time
 
 import pyte
 import ptyprocess
+from rich.cells import cell_len
 from rich.segment import Segment
 from rich.style import Style
 from textual import work
@@ -55,8 +57,6 @@ _FILTER_RE = re.compile(
 def _filter_unsupported(text: str) -> str:
     """Remove escape sequences that pyte can't handle."""
     return _FILTER_RE.sub('', text)
-
-from rich.cells import cell_len
 
 
 # Map pyte color names to Rich color names
@@ -255,8 +255,13 @@ class TerminalWidget(Widget):
 
     # ─── Keyboard input ───────────────────────────────────────────
 
-    # Keys reserved for the TUI app — NOT forwarded to the PTY
-    _RESERVED_KEYS = {"ctrl+q", "ctrl+backslash", "ctrl+t", "ctrl+b", "ctrl+p"}
+    # Keys reserved for the TUI app — NOT forwarded to the PTY.
+    # These keybindings are intercepted before reaching the child
+    # process so the user can always navigate the TUI regardless of
+    # what the subprocess expects. If a new global shortcut is added
+    # to the app, it MUST be registered here too, otherwise keystrokes
+    # will be swallowed by the PTY and never reach the App bindings.
+    _RESERVED_KEYS = {"ctrl+q", "ctrl+backslash", "ctrl+t", "ctrl+b", "ctrl+p", "ctrl+shift+c"}
 
     def on_key(self, event) -> None:
         """Forward keystrokes to the PTY, except reserved app shortcuts."""
@@ -326,58 +331,10 @@ class TerminalWidget(Widget):
 
         return None
 
-    # ─── Mouse input ──────────────────────────────────────────────
-
-    def on_mouse_down(self, event) -> None:
-        """Forward mouse clicks to PTY using SGR protocol."""
-        if not self._pty or not self._pty.isalive():
-            return
-        # SGR mouse: \x1b[<button;col;rowM
-        button = event.button - 1 if hasattr(event, 'button') else 0
-        col = event.x + 1
-        row = event.y + 1
-        seq = f"\x1b[<{button};{col};{row}M"
-        try:
-            self._pty.write(seq.encode())
-        except Exception:
-            pass
-
-    def on_mouse_up(self, event) -> None:
-        """Forward mouse release to PTY."""
-        if not self._pty or not self._pty.isalive():
-            return
-        button = event.button - 1 if hasattr(event, 'button') else 0
-        col = event.x + 1
-        row = event.y + 1
-        seq = f"\x1b[<{button};{col};{row}m"
-        try:
-            self._pty.write(seq.encode())
-        except Exception:
-            pass
-
-    def on_mouse_scroll_up(self, event) -> None:
-        """Forward scroll up to PTY."""
-        if not self._pty or not self._pty.isalive():
-            return
-        col = event.x + 1
-        row = event.y + 1
-        seq = f"\x1b[<64;{col};{row}M"
-        try:
-            self._pty.write(seq.encode())
-        except Exception:
-            pass
-
-    def on_mouse_scroll_down(self, event) -> None:
-        """Forward scroll down to PTY."""
-        if not self._pty or not self._pty.isalive():
-            return
-        col = event.x + 1
-        row = event.y + 1
-        seq = f"\x1b[<65;{col};{row}M"
-        try:
-            self._pty.write(seq.encode())
-        except Exception:
-            pass
+    # Mouse events are NOT forwarded to the PTY. Claude Code uses keyboard
+    # for all interactive elements (permissions, selectors). Not forwarding
+    # mouse lets the terminal emulator handle text selection and copy natively
+    # (hold Option in iTerm2 if needed).
 
     # ─── Rendering ────────────────────────────────────────────────
 
@@ -427,6 +384,23 @@ class TerminalWidget(Widget):
         return Strip(segments)
 
     # ─── Utilities ────────────────────────────────────────────────
+
+    def get_visible_text(self) -> str:
+        """Get all visible text from the terminal screen (for copy)."""
+        if not self._screen:
+            return ""
+        lines = []
+        for y in range(self._screen.lines):
+            row = self._screen.buffer[y]
+            line = "".join(
+                row[x].data if row[x].data else " "
+                for x in range(self._screen.columns)
+            ).rstrip()
+            lines.append(line)
+        # Strip trailing empty lines
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
 
     def write_to_pty(self, data: str) -> None:
         """Write data directly to the PTY."""

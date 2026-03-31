@@ -1,14 +1,16 @@
 """Main Textual application for claude-tui.
 
-Visual wrapper around Claude Code CLI with file tree, file viewer, diff view,
-command palette, and a polished custom UI.
+Visual wrapper around Claude Code CLI. Claude runs in a real PTY so all
+native behavior works (permissions, slash commands, interactive prompts).
+We add: file tree with git status, file viewer, diff navigator, and a
+command palette.
 """
 
 from __future__ import annotations
 
 import os
 import subprocess
-import time
+import sys
 from pathlib import Path
 
 from rich.text import Text
@@ -16,8 +18,7 @@ from textual import work, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Provider, Hit, Hits
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.reactive import reactive
+from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     DirectoryTree,
     Label,
@@ -31,119 +32,156 @@ from textual.widgets import (
 )
 
 from claude_tui.diff_tracker import DiffTracker, DiffSnapshot, FileDiff
+from claude_tui.session_screen import SessionPickerScreen
 from claude_tui.terminal_widget import TerminalWidget
 
 
-# ─── File type icons ─────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────
 
 _FILE_ICONS: dict[str, tuple[str, str]] = {
     ".py": ("py", "#3572A5"), ".js": ("js", "#f1e05a"),
     ".ts": ("ts", "#3178c6"), ".tsx": ("tx", "#3178c6"),
     ".jsx": ("jx", "#f1e05a"), ".json": ("{}", "#a8a8a2"),
     ".html": ("<>", "#e34c26"), ".css": ("# ", "#563d7c"),
-    ".scss": ("# ", "#c6538c"), ".md": ("md", "#083fa1"),
-    ".rs": ("rs", "#dea584"), ".go": ("go", "#00ADD8"),
-    ".rb": ("rb", "#701516"), ".java": ("jv", "#b07219"),
-    ".c": (" c", "#555555"), ".cpp": ("c+", "#f34b7d"),
-    ".h": (".h", "#555555"), ".swift": ("sw", "#F05138"),
-    ".kt": ("kt", "#A97BFF"), ".sh": ("$ ", "#89e051"),
-    ".bash": ("$ ", "#89e051"), ".zsh": ("$ ", "#89e051"),
+    ".md": ("md", "#083fa1"), ".rs": ("rs", "#dea584"),
+    ".go": ("go", "#00ADD8"), ".sh": ("$ ", "#89e051"),
     ".yaml": ("ym", "#cb171e"), ".yml": ("ym", "#cb171e"),
-    ".toml": ("tm", "#9c4221"), ".xml": ("xm", "#0060ac"),
-    ".lock": ("lk", "#555555"), ".env": ("ev", "#ECD53F"),
-    ".gitignore": ("gi", "#F05032"),
+    ".toml": ("tm", "#9c4221"),
+}
+
+_STATUS_STYLE = {
+    "modified": ("M", "#f59e0b"),
+    "added": ("A", "#4ade80"),
+    "deleted": ("D", "#f87171"),
+    "renamed": ("R", "#67e8f9"),
+    "untracked": ("?", "#8d99ae"),
+}
+
+_LANG_MAP = {
+    ".py": "python", ".js": "javascript", ".ts": "javascript",
+    ".tsx": "javascript", ".jsx": "javascript",
+    ".css": "css", ".html": "html", ".json": "json",
+    ".md": "markdown", ".rs": "rust", ".go": "go",
+    ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
+    ".sh": "bash", ".bash": "bash", ".zsh": "bash",
+    ".rb": "ruby", ".c": "c", ".cpp": "c", ".h": "c",
+    ".java": "java", ".swift": "swift", ".kt": "kotlin",
 }
 
 
-# ─── Custom header ───────────────────────────────────────────────────
+# ─── Widgets ──────────────────────────────────────────────────────────
 
 class TuiHeader(Static):
     DEFAULT_CSS = """
-    TuiHeader {
-        dock: top;
-        height: 1;
-        background: #1a1a2e;
-        color: #e0e0e0;
-        padding: 0 1;
-    }
+    TuiHeader { dock: top; height: 1; background: #1a1a2e; padding: 0 1; }
     """
-    cwd_display: reactive[str] = reactive("")
+
+    def __init__(self, cwd: str = "", **kw):
+        super().__init__(**kw)
+        self._cwd = cwd
 
     def render(self) -> Text:
         t = Text()
         t.append(" claude-tui ", style="bold #e07a5f on #1a1a2e")
-        t.append(" ", style="#1a1a2e")
-        if self.cwd_display:
-            t.append(f" {self.cwd_display} ", style="#8d99ae")
+        t.append("  ", style="#1a1a2e")
+        t.append(self._cwd, style="#8d99ae")
         return t
 
 
-# ─── Custom footer ───────────────────────────────────────────────────
-
 class TuiFooter(Static):
     DEFAULT_CSS = """
-    TuiFooter {
-        dock: bottom;
-        height: 1;
-        background: #1a1a2e;
-        color: #8d99ae;
-        padding: 0 0;
-    }
+    TuiFooter { dock: bottom; height: 1; background: #1a1a2e; }
     """
 
     def render(self) -> Text:
         t = Text()
         for key, label in [("^Q", "Quit"), ("^\\", "Tab"), ("^T", "Tree"),
-                           ("^B", "Terminal"), ("^P", "Commands")]:
+                           ("^B", "Terminal"), ("^P", "Commands"), ("^S-C", "Copy")]:
             t.append(f" {key} ", style="bold #e0e0e0 on #2d2d44")
             t.append(f" {label} ", style="#8d99ae on #1a1a2e")
         return t
 
 
-# ─── File tree ───────────────────────────────────────────────────────
-
 class FileTree(DirectoryTree):
+    """File tree with git status indicators and type icons."""
+
     DEFAULT_CSS = """
-    FileTree {
-        background: #12121a;
-        scrollbar-size: 1 1;
-    }
+    FileTree { background: #12121a; scrollbar-size: 1 1; }
     """
+
     _HIDDEN = {".git", "node_modules", "__pycache__", ".venv", ".mypy_cache",
-               ".ruff_cache", ".DS_Store", ".claude", ".env", ".pytest_cache",
-               ".tox", "dist", "build"}
+               ".ruff_cache", ".DS_Store", ".claude", ".pytest_cache", "dist", "build"}
+
+    def __init__(self, path: str, **kw):
+        super().__init__(path, **kw)
+        self._git_status: dict[str, str] = {}
 
     def filter_paths(self, paths):
-        return [p for p in paths if p.name not in self._HIDDEN
-                and not p.name.endswith(".egg-info")]
+        return [p for p in paths
+                if p.name not in self._HIDDEN and not p.name.endswith(".egg-info")]
+
+    def refresh_git_status(self) -> None:
+        """Run git status and cache the results."""
+        try:
+            r = subprocess.run(
+                ["git", "status", "--porcelain", "-u"],
+                cwd=str(self.path), capture_output=True, text=True, timeout=5,
+            )
+            status: dict[str, str] = {}
+            for line in r.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                code = line[:2].strip()
+                fpath = line[3:].strip()
+                if code in ("M", "MM", "AM"):
+                    status[fpath] = "modified"
+                elif code in ("A", "??"):
+                    status[fpath] = "added" if code == "A" else "untracked"
+                elif code == "D":
+                    status[fpath] = "deleted"
+                elif code.startswith("R"):
+                    status[fpath] = "renamed"
+            self._git_status = status
+        except Exception:
+            pass
 
     def render_label(self, node, base_style, style):
         label = super().render_label(node, base_style, style)
         path = node.data.path if node.data else None
-        if not path or path.is_dir():
+        if not path:
             return label
-        ext = path.suffix.lower()
-        name = path.name.lower()
-        entry = _FILE_ICONS.get(name) or _FILE_ICONS.get(ext)
-        if not entry:
-            return label
-        icon, color = entry
-        return Text.assemble(Text(f"{icon} ", style=f"dim {color}"), label)
 
+        parts = []
 
-# ─── Resize handle ───────────────────────────────────────────────────
+        # File type icon (files only)
+        if not path.is_dir():
+            entry = _FILE_ICONS.get(path.name.lower()) or _FILE_ICONS.get(path.suffix.lower())
+            if entry:
+                parts.append(Text(f"{entry[0]} ", style=f"dim {entry[1]}"))
+
+        parts.append(label)
+
+        # Git status indicator
+        try:
+            rel = str(path.relative_to(self.path))
+        except ValueError:
+            rel = ""
+        if rel in self._git_status:
+            st = self._git_status[rel]
+            char, color = _STATUS_STYLE.get(st, ("?", "#8d99ae"))
+            parts.append(Text(f" {char}", style=f"bold {color}"))
+
+        return Text.assemble(*parts)
+
 
 class ResizeHandle(Static):
     DEFAULT_CSS = """
-    ResizeHandle {
-        width: 1; height: 100%;
-        background: #1e1e2e; color: #3a3a5a;
-    }
+    ResizeHandle { width: 1; height: 100%; background: #1e1e2e; color: #3a3a5a; }
     ResizeHandle:hover { background: #e07a5f; color: #e07a5f; }
     """
 
-    def __init__(self, **kwargs):
-        super().__init__("│", **kwargs)
+    def __init__(self, **kw):
+        super().__init__("│", **kw)
         self._dragging = False
 
     def on_mouse_down(self, event):
@@ -163,46 +201,23 @@ class ResizeHandle(Static):
             event.stop()
 
 
-# ─── Diff panel widgets ──────────────────────────────────────────────
-
-class DiffFileList(ListView):
-    """List of changed files — click one to see its diff."""
+class DiffSummary(Static):
     DEFAULT_CSS = """
-    DiffFileList {
-        height: auto;
-        max-height: 10;
-        background: #12121a;
-        border-bottom: solid #2a2a3e;
-    }
-    DiffFileList > ListItem {
-        padding: 0 1;
-        height: 1;
-    }
-    DiffFileList > ListItem.-highlight {
-        background: #1e1e2e;
-    }
+    DiffSummary { height: 1; background: #1a1a2e; color: #8d99ae; padding: 0 1; }
     """
 
 
-class DiffSummary(Static):
-    """Summary line above the file list."""
+class DiffFileList(ListView):
     DEFAULT_CSS = """
-    DiffSummary {
-        height: 1;
-        background: #1a1a2e;
-        color: #8d99ae;
-        padding: 0 1;
-    }
+    DiffFileList { height: auto; max-height: 10; background: #12121a; border-bottom: solid #2a2a3e; }
+    DiffFileList > ListItem { padding: 0 1; height: 1; }
+    DiffFileList > ListItem.-highlight { background: #1e1e2e; }
     """
 
 
 class DiffContent(RichLog):
-    """The actual diff content for the selected file."""
     DEFAULT_CSS = """
-    DiffContent {
-        height: 1fr;
-        background: #0d0d14;
-    }
+    DiffContent { height: 1fr; background: #0d0d14; }
     """
 
 
@@ -214,25 +229,34 @@ class TuiCommands(Provider):
         commands = [
             ("Focus Terminal", "Switch to Claude terminal", "focus_terminal"),
             ("Focus File Tree", "Switch to file tree", "focus_tree"),
-            ("Tab: Terminal", "Terminal tab", "tab_terminal"),
-            ("Tab: Files", "Files tab", "tab_files"),
-            ("Tab: Diff", "Diff tab", "tab_diff"),
-            ("Refresh File Tree", "Reload file tree", "refresh_tree"),
+            ("Tab: Terminal", "Switch to Terminal tab", "tab_terminal"),
+            ("Tab: Files", "Switch to Files tab", "tab_files"),
+            ("Tab: Diff", "Switch to Diff tab", "tab_diff"),
+            ("Refresh File Tree", "Reload the file tree", "refresh_tree"),
             ("Refresh Diff", "Re-scan for changes", "reload_diff"),
+            ("Resume Session", "Browse and resume past sessions", "open_session_picker"),
+            ("Copy Terminal", "Copy terminal content to clipboard", "copy_terminal"),
             ("Quit", "Exit claude-tui", "request_quit"),
         ]
         matcher = self.matcher(query)
         for name, help_text, action in commands:
-            score = matcher.match(name)
-            if score > 0:
-                async def _run(act=action):
-                    await app.run_action(act)
-                yield Hit(score, matcher.highlight(name), _run, text=name, help=help_text)
+            async def _run(act=action):
+                await app.run_action(act)
+
+            if not query:
+                # No query: show all commands
+                yield Hit(1.0, name, _run, text=name, help=help_text)
+            else:
+                score = matcher.match(name)
+                if score > 0:
+                    yield Hit(score, matcher.highlight(name), _run, text=name, help=help_text)
 
 
-# ─── Main App ────────────────────────────────────────────────────────
+# ─── App ──────────────────────────────────────────────────────────────
 
 class ClaudeTuiApp(App):
+    """Terminal UI IDE wrapper for Claude Code."""
+
     TITLE = "claude-tui"
     COMMANDS = {TuiCommands}
 
@@ -240,7 +264,6 @@ class ClaudeTuiApp(App):
     Screen { layout: vertical; background: #0d0d14; }
     #main-content { height: 1fr; }
     #file-tree { width: 28; min-width: 15; max-width: 60; background: #12121a; border-right: solid #2a2a3e; }
-    #resize-handle { width: 1; }
     #tab-panel { width: 1fr; background: #0d0d14; }
     #claude-terminal { height: 1fr; width: 1fr; }
     #file-viewer { height: 1fr; background: #0d0d14; }
@@ -255,33 +278,39 @@ class ClaudeTuiApp(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+backslash", "cycle_tab", "Next Tab", show=False),
-        Binding("ctrl+t", "focus_tree", "Tree", show=False),
-        Binding("ctrl+b", "focus_terminal", "Terminal", show=False),
-        Binding("ctrl+p", "command_palette", "Commands", show=False),
-        Binding("ctrl+q", "request_quit", "Quit", show=False),
+        Binding("ctrl+backslash", "cycle_tab", show=False),
+        Binding("ctrl+t", "focus_tree", show=False),
+        Binding("ctrl+b", "focus_terminal", show=False),
+        Binding("ctrl+p", "command_palette", show=False),
+        Binding("ctrl+shift+c", "copy_terminal", show=False),
+        Binding("ctrl+q", "request_quit", show=False),
     ]
 
-    def __init__(self, claude_args: list[str] | None = None, cwd: str = ".") -> None:
+    def __init__(
+        self,
+        claude_args: list[str] | None = None,
+        cwd: str = ".",
+        open_session_picker: bool = False,
+    ) -> None:
         super().__init__()
         self.claude_cwd = str(Path(cwd).resolve())
         self.claude_args = claude_args or []
-        self.diff_tracker = DiffTracker(self.claude_cwd)
-        self._current_snapshot: DiffSnapshot | None = None
-        self._last_diff_hash = ""
-
-    def _build_claude_command(self) -> list[str]:
-        return ["claude"] + self.claude_args
+        self._open_session_picker = open_session_picker
+        self._current_snap: DiffSnapshot | None = None
+        self.diff_tracker = DiffTracker(
+            self.claude_cwd,
+            on_change=self._on_files_changed,
+        )
 
     def compose(self) -> ComposeResult:
-        yield TuiHeader(id="tui-header")
+        yield TuiHeader(cwd=self._short_cwd(), id="tui-header")
         with Horizontal(id="main-content"):
             yield FileTree(self.claude_cwd, id="file-tree")
             yield ResizeHandle(id="resize-handle")
             with TabbedContent(id="tab-panel"):
                 with TabPane("Terminal", id="tab-terminal"):
                     yield TerminalWidget(
-                        command=self._build_claude_command(),
+                        command=["claude"] + self.claude_args,
                         cwd=self.claude_cwd,
                         id="claude-terminal",
                     )
@@ -295,23 +324,84 @@ class ClaudeTuiApp(App):
         yield TuiFooter(id="tui-footer")
 
     def on_mount(self) -> None:
-        self.query_one("#tui-header", TuiHeader).cwd_display = self._short_cwd()
-        self.query_one("#claude-terminal", TerminalWidget).focus()
-        self.diff_tracker.take_baseline()
+        self.diff_tracker.start_watching()
+        self._refresh_git_status()
         self._watch_pty_exit()
-        self._auto_refresh_tree()
-        self._watch_file_changes()
+
+        # Disable Textual's mouse tracking so the terminal emulator handles
+        # mouse natively — enables text selection and copy/paste without
+        # holding modifier keys. All TUI navigation works via keyboard.
+        sys.stdout.write("\x1b[?1000l\x1b[?1003l\x1b[?1015l\x1b[?1006l")
+        sys.stdout.flush()
+
+        if self._open_session_picker:
+            self._show_session_picker()
+        else:
+            self.query_one("#claude-terminal", TerminalWidget).focus()
 
     def _short_cwd(self) -> str:
         home = os.path.expanduser("~")
-        if self.claude_cwd.startswith(home):
-            return "~" + self.claude_cwd[len(home):]
-        return self.claude_cwd
+        return ("~" + self.claude_cwd[len(home):]) if self.claude_cwd.startswith(home) else self.claude_cwd
+
+    def _show_session_picker(self) -> None:
+        """Open the session picker and resume the selected session."""
+        async def _on_result(result: tuple[str, str] | None) -> None:
+            if result is None:
+                if self._open_session_picker:
+                    # Opened with --resume, cancel = exit app
+                    await self.action_request_quit()
+                else:
+                    # Opened from command palette, cancel = back to terminal
+                    self.query_one("#claude-terminal", TerminalWidget).focus()
+                return
+            project_path, session_id = result
+            # Restart the terminal widget with --resume in the correct cwd
+            try:
+                old_term = self.query_one("#claude-terminal", TerminalWidget)
+                await old_term.cleanup()
+                await old_term.remove()
+            except Exception:
+                pass
+            # Update cwd to the session's project
+            self.claude_cwd = project_path
+            self.query_one("#tui-header", TuiHeader)._cwd = self._short_cwd()
+            self.query_one("#tui-header", TuiHeader).refresh()
+            # Mount new terminal with --resume
+            pane = self.query_one("#tab-terminal", TabPane)
+            new_term = TerminalWidget(
+                command=["claude", "--resume", session_id] + self.claude_args,
+                cwd=project_path,
+                id="claude-terminal",
+            )
+            await pane.mount(new_term)
+            new_term.focus()
+            self.notify(f"Resumed session in {Path(project_path).name}", timeout=3)
+
+        self.push_screen(SessionPickerScreen(), callback=_on_result)
+
+    def _on_files_changed(self) -> None:
+        """Called by watchdog when files change — update diff + tree."""
+        try:
+            self.call_from_thread(self._refresh_diff)
+            self.call_from_thread(self._refresh_git_status)
+        except Exception:
+            pass
+
+    def _refresh_git_status(self) -> None:
+        tree = self.query_one("#file-tree", FileTree)
+        tree.refresh_git_status()
+        tree.refresh()
+
+    def _refresh_diff(self) -> None:
+        snap = self.diff_tracker.get_diff()
+        self._current_snap = snap
+        self._render_diff_ui(snap)
 
     # ─── Background workers ───────────────────────────────────────
 
     @work(thread=True, name="pty-watcher")
     def _watch_pty_exit(self) -> None:
+        import time
         term = self.query_one("#claude-terminal", TerminalWidget)
         while True:
             time.sleep(0.5)
@@ -319,34 +409,10 @@ class ClaudeTuiApp(App):
                 self.app.call_from_thread(self.exit)
                 break
 
-    @work(thread=True, name="tree-refresher")
-    def _auto_refresh_tree(self) -> None:
-        while True:
-            time.sleep(5)
-            try:
-                self.app.call_from_thread(self.query_one("#file-tree", FileTree).reload)
-            except Exception:
-                break
-
-    @work(thread=True, name="diff-watcher")
-    def _watch_file_changes(self) -> None:
-        """Poll git diff for changes and update the diff tab automatically."""
-        while True:
-            time.sleep(3)
-            try:
-                snap = self.diff_tracker.get_full_diff()
-                # Only update if something changed
-                new_hash = snap.summary + "".join(f.path for f in snap.files)
-                if new_hash != self._last_diff_hash:
-                    self._last_diff_hash = new_hash
-                    self._current_snapshot = snap
-                    self.app.call_from_thread(self._update_diff_ui, snap)
-            except Exception:
-                break
-
     # ─── Quit ─────────────────────────────────────────────────────
 
     async def action_request_quit(self) -> None:
+        self.diff_tracker.stop_watching()
         try:
             await self.query_one("#claude-terminal", TerminalWidget).cleanup()
         except Exception:
@@ -354,6 +420,7 @@ class ClaudeTuiApp(App):
         self.exit()
 
     async def on_unmount(self) -> None:
+        self.diff_tracker.stop_watching()
         try:
             await self.query_one("#claude-terminal", TerminalWidget).cleanup()
         except Exception:
@@ -364,101 +431,73 @@ class ClaudeTuiApp(App):
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         path = str(event.path)
         try:
-            content = Path(path).read_text(errors="replace")
             viewer = self.query_one("#file-viewer", TextArea)
-            viewer.load_text(content)
-            ext_map = {
-                ".py": "python", ".js": "javascript", ".ts": "javascript",
-                ".tsx": "javascript", ".jsx": "javascript",
-                ".css": "css", ".html": "html", ".json": "json",
-                ".md": "markdown", ".rs": "rust", ".go": "go",
-                ".yaml": "yaml", ".yml": "yaml", ".toml": "toml",
-                ".sh": "bash", ".bash": "bash", ".zsh": "bash",
-                ".rb": "ruby", ".c": "c", ".cpp": "c", ".h": "c",
-                ".java": "java", ".swift": "swift", ".kt": "kotlin",
-            }
-            lang = ext_map.get(Path(path).suffix)
+            viewer.load_text(Path(path).read_text(errors="replace"))
+            lang = _LANG_MAP.get(Path(path).suffix)
             if lang:
                 try:
                     viewer.language = lang
                 except Exception:
                     pass
             self.query_one("#tab-panel", TabbedContent).active = "tab-files"
-            self.notify(f"Opened {Path(path).name}", timeout=2)
         except Exception:
             pass
 
     # ─── Diff tab ─────────────────────────────────────────────────
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        if event.pane.id == "tab-diff" and self._current_snapshot:
-            self._update_diff_ui(self._current_snapshot)
+        if event.pane.id == "tab-diff":
+            self._refresh_diff()
 
-    def _update_diff_ui(self, snap: DiffSnapshot) -> None:
-        """Update the diff panel with a new snapshot."""
-        # Update summary
-        summary = self.query_one("#diff-summary", DiffSummary)
-        if not snap.files:
-            summary.update(Text(f"  {snap.summary}", style="dim italic"))
-        else:
-            t = Text()
-            t.append(f"  {snap.summary}", style="#8d99ae")
-            summary.update(t)
+    def _render_diff_ui(self, snap: DiffSnapshot) -> None:
+        self.query_one("#diff-summary", DiffSummary).update(
+            Text(f"  {snap.summary}", style="dim italic" if not snap.files else "#8d99ae")
+        )
 
-        # Update file list
         file_list = self.query_one("#diff-file-list", DiffFileList)
         file_list.clear()
         for f in snap.files:
-            status_style = {
-                "modified": "#f59e0b",
-                "added": "#4ade80",
-                "deleted": "#f87171",
-                "renamed": "#67e8f9",
-            }.get(f.status, "#8d99ae")
-            status_char = {"modified": "M", "added": "A", "deleted": "D", "renamed": "R"}.get(f.status, "?")
+            char, color = _STATUS_STYLE.get(f.status, ("?", "#8d99ae"))
             label = Text.assemble(
-                Text(f" {status_char} ", style=f"bold {status_style}"),
+                Text(f" {char} ", style=f"bold {color}"),
                 Text(f.path, style="#e0e0e0"),
                 Text(f"  +{f.additions} -{f.deletions}", style="dim"),
             )
             file_list.append(ListItem(Label(label), name=f.path))
 
-        # Show first file's diff by default
         if snap.files:
-            self._show_file_diff(snap.files[0])
+            self._render_file_diff(snap.files[0])
+        else:
+            self.query_one("#diff-content", DiffContent).clear()
 
     @on(ListView.Selected, "#diff-file-list")
-    def on_diff_file_selected(self, event: ListView.Selected) -> None:
-        """Show the diff for the selected file."""
-        if not self._current_snapshot or not event.item.name:
+    def _on_diff_file_selected(self, event: ListView.Selected) -> None:
+        if not self._current_snap or not event.item.name:
             return
-        for f in self._current_snapshot.files:
+        for f in self._current_snap.files:
             if f.path == event.item.name:
-                self._show_file_diff(f)
+                self._render_file_diff(f)
                 break
 
-    def _show_file_diff(self, file_diff: FileDiff) -> None:
-        """Render a single file's diff in the content area."""
+    def _render_file_diff(self, f: FileDiff) -> None:
         content = self.query_one("#diff-content", DiffContent)
         content.clear()
-
-        for line in file_diff.diff_text.splitlines():
+        for line in f.diff_text.splitlines():
             if line.startswith("diff --git"):
-                content.write(Text(line, style="bold #c084fc"))
-            elif line.startswith("index "):
-                content.write(Text(line, style="dim"))
-            elif line.startswith("+++") or line.startswith("---"):
-                content.write(Text(line, style="bold"))
+                style = "bold #c084fc"
+            elif line.startswith(("new file", "deleted file")):
+                style = "bold #f59e0b"
+            elif line.startswith(("+++", "---")):
+                style = "bold"
             elif line.startswith("@@"):
-                content.write(Text(line, style="#67e8f9"))
+                style = "#67e8f9"
             elif line.startswith("+"):
-                content.write(Text(line, style="#4ade80"))
+                style = "#4ade80"
             elif line.startswith("-"):
-                content.write(Text(line, style="#f87171"))
-            elif line.startswith("new file") or line.startswith("deleted file"):
-                content.write(Text(line, style="bold #f59e0b"))
+                style = "#f87171"
             else:
-                content.write(Text(line, style="dim"))
+                style = "dim"
+            content.write(Text(line, style=style))
 
     # ─── Actions ──────────────────────────────────────────────────
 
@@ -479,22 +518,39 @@ class ClaudeTuiApp(App):
         self.query_one("#tab-panel", TabbedContent).active = "tab-diff"
 
     def action_refresh_tree(self) -> None:
-        self.query_one("#file-tree", FileTree).reload()
+        tree = self.query_one("#file-tree", FileTree)
+        tree.refresh_git_status()
+        tree.reload()
         self.notify("File tree refreshed", timeout=2)
 
     def action_reload_diff(self) -> None:
-        snap = self.diff_tracker.get_full_diff()
-        self._current_snapshot = snap
-        self._update_diff_ui(snap)
+        self._refresh_diff()
         self.notify("Diff refreshed", timeout=2)
+
+    def action_copy_terminal(self) -> None:
+        """Copy visible terminal text to system clipboard."""
+        try:
+            term = self.query_one("#claude-terminal", TerminalWidget)
+            text = term.get_visible_text()
+            if not text:
+                self.notify("Nothing to copy", timeout=2)
+                return
+            proc = subprocess.run(
+                ["pbcopy"], input=text.encode(), timeout=5,
+            )
+            if proc.returncode == 0:
+                self.notify("Terminal content copied", timeout=2)
+        except Exception:
+            self.notify("Copy failed", timeout=2)
+
+    def action_open_session_picker(self) -> None:
+        self._show_session_picker()
 
     def action_cycle_tab(self) -> None:
         tabs = self.query_one("#tab-panel", TabbedContent)
         order = ["tab-terminal", "tab-files", "tab-diff"]
-        current = tabs.active
         try:
-            idx = order.index(current)
-            nxt = order[(idx + 1) % len(order)]
+            nxt = order[(order.index(tabs.active) + 1) % len(order)]
         except ValueError:
             nxt = "tab-terminal"
         tabs.active = nxt
