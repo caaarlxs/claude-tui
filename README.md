@@ -4,6 +4,8 @@ Terminal UI IDE wrapper for [Claude Code](https://claude.ai/code) CLI.
 
 Runs Claude Code inside a polished TUI with a file tree, file viewer with syntax highlighting, and a live diff navigator — while keeping **all native Claude behavior** (permissions, slash commands, interactive prompts).
 
+![claude-tui screenshot](assets/screenshot.png)
+
 ## Features
 
 - **Native Claude Code** — runs in a real PTY, everything works exactly as in your terminal
