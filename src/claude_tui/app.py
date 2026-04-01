@@ -297,6 +297,8 @@ class ClaudeTuiApp(App):
         self.claude_args = claude_args or []
         self._open_session_picker = open_session_picker
         self._current_snap: DiffSnapshot | None = None
+        self._exit_message: str = ""  # Message to print after TUI exits
+        self._resuming = False  # True while switching sessions (suppresses auto-exit)
         self.diff_tracker = DiffTracker(
             self.claude_cwd,
             on_change=self._on_files_changed,
@@ -355,7 +357,8 @@ class ClaudeTuiApp(App):
                     self.query_one("#claude-terminal", TerminalWidget).focus()
                 return
             project_path, session_id = result
-            # Restart the terminal widget with --resume in the correct cwd
+            # Prevent pty-watcher from killing the app while we swap terminals
+            self._resuming = True
             try:
                 old_term = self.query_one("#claude-terminal", TerminalWidget)
                 await old_term.cleanup()
@@ -368,6 +371,8 @@ class ClaudeTuiApp(App):
             self.query_one("#tui-header", TuiHeader).refresh()
             # Mount new terminal with --resume
             pane = self.query_one("#tab-terminal", TabPane)
+            tabs = self.query_one("#tab-panel", TabbedContent)
+            tabs.active = "tab-terminal"
             new_term = TerminalWidget(
                 command=["claude", "--resume", session_id] + self.claude_args,
                 cwd=project_path,
@@ -375,6 +380,9 @@ class ClaudeTuiApp(App):
             )
             await pane.mount(new_term)
             new_term.focus()
+            self._resuming = False
+            # Restart the watcher for the new terminal
+            self._watch_pty_exit()
             self.notify(f"Resumed session in {Path(project_path).name}", timeout=3)
 
         self.push_screen(SessionPickerScreen(), callback=_on_result)
@@ -402,19 +410,53 @@ class ClaudeTuiApp(App):
     @work(thread=True, name="pty-watcher")
     def _watch_pty_exit(self) -> None:
         import time
-        term = self.query_one("#claude-terminal", TerminalWidget)
+        start = time.monotonic()
         while True:
             time.sleep(0.5)
+            # Don't exit while resuming a different session
+            if self._resuming:
+                continue
+            try:
+                term = self.query_one("#claude-terminal", TerminalWidget)
+            except Exception:
+                continue
             if not term.is_alive:
-                self.app.call_from_thread(self.exit)
+                elapsed = time.monotonic() - start
+                if elapsed < 3:
+                    # Died too fast — likely a bad flag. Wait so user can see error.
+                    time.sleep(3)
+                # Capture session info from terminal for the exit message
+                text = term.get_visible_text()
+                self._extract_exit_info(text)
+                self.app.call_from_thread(self._graceful_exit)
                 break
+
+    def _extract_exit_info(self, terminal_text: str) -> None:
+        """Extract session ID from terminal output for the exit message."""
+        import re
+        # Claude prints "To resume: claude --resume <id>" on exit
+        match = re.search(r"--resume\s+([a-f0-9-]{36})", terminal_text)
+        if match:
+            session_id = match.group(1)
+            self._exit_message = (
+                f"\nTo resume this session:\n"
+                f"  claude-tui --resume {session_id}\n"
+                f"  claude-tui --resume  (session picker)\n"
+            )
+
+    def _graceful_exit(self) -> None:
+        self.diff_tracker.stop_watching()
+        self.exit()
 
     # ─── Quit ─────────────────────────────────────────────────────
 
     async def action_request_quit(self) -> None:
         self.diff_tracker.stop_watching()
         try:
-            await self.query_one("#claude-terminal", TerminalWidget).cleanup()
+            term = self.query_one("#claude-terminal", TerminalWidget)
+            text = term.get_visible_text()
+            self._extract_exit_info(text)
+            await term.cleanup()
         except Exception:
             pass
         self.exit()
@@ -425,6 +467,9 @@ class ClaudeTuiApp(App):
             await self.query_one("#claude-terminal", TerminalWidget).cleanup()
         except Exception:
             pass
+        # Print exit message after TUI clears the screen
+        if self._exit_message:
+            print(self._exit_message)
 
     # ─── File viewer ──────────────────────────────────────────────
 
