@@ -332,9 +332,20 @@ class TerminalWidget(Widget):
         return None
 
     # Mouse events are NOT forwarded to the PTY. Claude Code uses keyboard
-    # for all interactive elements (permissions, selectors). Not forwarding
-    # mouse lets the terminal emulator handle text selection and copy natively
-    # (hold Option in iTerm2 if needed).
+    # for all interactive elements. Leaving mouse to the terminal emulator
+    # enables native text selection, copy/paste, and file drag-and-drop.
+
+    def on_paste(self, event) -> None:
+        """Handle paste events (including drag-and-drop from Finder)."""
+        if not self._pty or not self._pty.isalive():
+            return
+        text = event.text if hasattr(event, "text") else ""
+        if text:
+            try:
+                self._pty.write(text.encode("utf-8"))
+            except Exception:
+                pass
+            event.stop()
 
     # ─── Rendering ────────────────────────────────────────────────
 

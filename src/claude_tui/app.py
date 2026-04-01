@@ -331,15 +331,21 @@ class ClaudeTuiApp(App):
         self._watch_pty_exit()
 
         # Disable Textual's mouse tracking so the terminal emulator handles
-        # mouse natively — enables text selection and copy/paste without
-        # holding modifier keys. All TUI navigation works via keyboard.
-        sys.stdout.write("\x1b[?1000l\x1b[?1003l\x1b[?1015l\x1b[?1006l")
-        sys.stdout.flush()
+        # mouse natively — enables text selection, copy/paste, and drag-drop.
+        # Textual re-enables mouse tracking on renders, so we disable it
+        # repeatedly via a timer.
+        self._disable_mouse()
+        self.set_interval(0.5, self._disable_mouse)
 
         if self._open_session_picker:
             self._show_session_picker()
         else:
             self.query_one("#claude-terminal", TerminalWidget).focus()
+
+    def _disable_mouse(self) -> None:
+        """Disable mouse tracking escape sequences."""
+        sys.stdout.write("\x1b[?1000l\x1b[?1003l\x1b[?1015l\x1b[?1006l")
+        sys.stdout.flush()
 
     def _short_cwd(self) -> str:
         home = os.path.expanduser("~")
